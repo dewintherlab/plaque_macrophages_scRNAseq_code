@@ -1,5 +1,10 @@
 # Ignore everything
 *
+
+# Except the code folders
+!1.SORT-seq/
+!2.SORT-seq_plus_10X_patients/
+
 # Except .R and .py  files (the code!)
 !*.R
 !*.py
