@@ -1,0 +1,475 @@
+---
+title: "02_processing_sc_RNA_and_preparation_deconvolution"
+author: "Yayuan Zhu"
+date: "2024-08-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 2.1 Introduction
+
+------------------------------------------------------------------------
+
+...
+
+# 2.2 Libraries
+
+------------------------------------------------------------------------
+
+```{r}
+library(tidyverse)
+library(magrittr)
+library(reshape2)
+
+library(Seurat)
+
+library(scCustomize)
+```
+
+# 2.3 Processing scRNA-seq reference
+
+To use the AtheroExpress plaque scRNA-seq dataset as the reference for the cellular deconvolution, continue to Section 2.3.1. For the use of the Tabula Sapiens dataset as the reference, move to Section 2.3.2.
+
+## 2.3.1 AtheroExpress plaque
+
+```{r}
+scAEplaque <- subset(read_rds("data/raw_data/full.43p_10X.integrated.cleaned.archetypes.seurat.RDS"), Tissue != "PBMC")
+
+scAEplaque@meta.data %<>%
+  mutate("cluster25" = as.character(Idents(scAEplaque)))
+
+gc()
+```
+
+### 2.3.1.1 Filtering low frequency of cell types
+
+```{r}
+ctFreq <- as_tibble(table(original = scAEplaque@meta.data$cluster25))
+
+keepCellTypes <- factor(ctFreq$original[ctFreq$n >= 50])
+
+ctFreq <- ctFreq[ctFreq$original %in% keepCellTypes,]
+scAEplaqueFilterFreq <- subset(scAEplaque, idents = keepCellTypes)
+```
+
+### 2.3.1.2 Grouping into major cell types
+
+```{r}
+patternCellTypes <- list("Dendritic cell" = "(?i)cDC1|cDC2",
+                         "Endothelial cell" = "(?i)endothelial",
+                         "Macrophage" = "(?i)macrophage",
+                         "Mast cell" = "(?i)mast",
+                         "Memory B cell" = "(?i)\\sB\\scell",
+                         "Smooth muscle cell" = "(?i)smooth",
+                         "T/NK cell" = "(?i)(\\sT\\scell)|(NK\\scell)")
+
+cluster <- lapply(patternCellTypes, function(pattern) {
+  str_subset(ctFreq$original, pattern)
+})
+
+# Modify cell type overview dataframe
+ctFreq$cluster7 <- ctFreq$original
+
+for(name in names(cluster)) {
+  ctFreq$cluster7[ctFreq$original %in% cluster[[name]]] <- name
+}
+```
+
+```{r}
+# Modify metadata of the Seurat object
+scAEplaqueFilterFreq@meta.data$cluster7 <- scAEplaqueFilterFreq@meta.data$cluster25
+
+for(name in names(cluster)) {
+  scAEplaqueFilterFreq@meta.data$cluster7[scAEplaqueFilterFreq@meta.data$cluster7 %in% cluster[[name]]] <- name
+}
+```
+
+## 2.3.2 Tabula Sapiens
+
+```{r}
+scTS <- read_rds("data/raw_data/Tabula_Sapiens_all_cells.rds")
+
+Idents(scTS) <- scTS@meta.data$cell_ontology_class
+
+# Only retain major contributing organs
+organsToInclude <- c("Blood", "Liver", "Lymph_Node", "Fat", "Bone_Marrow", "Heart", "Muscle", "Pancreas", "Large_Intestine", "Lung", "Small_Intestine", "Vasculature", "Kidney")
+
+scTSMetadata <- scTS@meta.data %>%
+  filter(tissue_in_publication %in% organsToInclude &
+           !(tissue_in_publication == "Heart" & cell_ontology_class == "hepatocyte") &
+           !(cell_ontology_class == "endothelial cell" & ! (tissue_in_publication %in% c("Vasculature", "Fat"))))
+
+scTSMetadata$cell_ontology_class <- as.character(scTSMetadata$cell_ontology_class)
+
+gc()
+```
+
+### 2.3.2.1 Grouping into major cell types
+
+```{r}
+ctFreq <- as_tibble(table(original = scTSMetadata$cell_ontology_class))
+
+patternCellTypes <- list(
+  "Monocyte" = "(?i)dendritic|monocyte|macrophage|langerhans",
+  "Mesenchymal cell/fibroblast" = "(?i)fibroblast|stellate|adventitial|mesenchymal",
+  "Skeletal muscle cell" = "(?i)[^hc] muscle",
+  "B cell" = "(?i)(^|\\b)b\\scell|plasma[^c]",
+  "Platelet" = "(?i)platelet",
+  "Basophil/mast cell" = "(?i)basophil|mast",
+  "Neutrophil" = "(?i)neutrophil",
+  "Erythrocyte" = "(?i)erythrocyte",
+  "Cardiac muscle cell" = "(?i)cardiac muscle",
+  "Pericyte/smooth muscle cell" = "(?i)smooth|myometrial|pericyte",
+  "T/NK cell" = "(?i)(nk)|(natural)|((\\A|\\W)t cell)",
+  "Kidney epithelial cell" = "(?i)kidney",
+  "Enterocyte" = "(?i)^(enterocyte|mature enterocyte)",
+  "Hepatocyte" = "(?i)hepatocyte",
+  "Pancreatic epithelial cell" = "(?i)pancreatic (ductal|acinar)",
+  "Pneumocyte" = "(?i)pneumocyte",
+  "Endothelial cell" = "(?i)^endothelial cell\\Z|endothelial cell of [^h]|lymphatic|vein endo|artery endo|cardiac endo|capillary endo")
+
+cluster <- lapply(patternCellTypes, function(pattern) {
+  str_subset(ctFreq$original, pattern)
+})
+
+# Modify cell type overview dataframe
+# 17 major cell types
+ctFreq$cluster17 <- ctFreq$original
+
+for(name in names(cluster)) {
+  ctFreq$cluster17[ctFreq$original %in% cluster[[name]]] <- name
+}
+
+# 13 and 10  major cell types
+epithelialCells <- c("Kidney epithelial cell", "Enterocyte", "Hepatocyte", "Pancreatic epithelial cell", "Pneumocyte")
+
+plaqueCells <- c("Monocyte", "Mesenchymal cell/fibroblast", "B cell", "Platelet", "Basophil/mast cell", "Neutrophil", "Erythrocyte", "Pericyte/smooth muscle cell", "T/NK cell", "Endothelial cell")
+
+ctFreq %<>%
+  mutate(cluster13 = ifelse(cluster17 %in% epithelialCells, "Epithelial cell", cluster17)) %>%
+  mutate(cluster10 = ifelse(cluster13 %in% plaqueCells, cluster13, NA))
+```
+
+```{r}
+# Modify metadata of the Seurat object
+scTSMetadata$cluster17 <- scTSMetadata$cell_ontology_class
+
+for(name in names(cluster)) {
+  scTSMetadata$cluster17[scTSMetadata$cluster17 %in% cluster[[name]]] <- name
+}
+
+scTSMetadata$cluster17[!(scTSMetadata$cluster17 %in% names(cluster))] <- NA
+
+scTSMetadata %<>%
+  mutate(cluster13 = ifelse(cluster17 %in% epithelialCells, "Epithelial cell", cluster17)) %>%
+  mutate(cluster10 = ifelse(cluster13 %in% plaqueCells, cluster13, NA)) %>%
+  mutate_at(c("cluster17", "cluster13", "cluster10"), factor)
+```
+
+```{r}
+scTS@meta.data <- scTSMetadata
+```
+
+### 2.3.2.2 Subsetting into smaller Seurat objects
+
+As processing the original Tabula Sapiens Seurat object is too memory-heavy, the frequency of the different cell types will be capped at 1000. To achieve this, a maximum of 1000 cell types will be subsetted at random.
+
+```{r}
+clusterToUse <- "cluster17" # MODIFY HERE
+nSeurat <- seq_len(1) # MODIFY HERE; number of Seurat objects to create
+
+ctFreqNew <- as_tibble(table(Celltype = scTSMetadata[[clusterToUse]]))
+
+ctAbove1000 <- ctFreqNew$Celltype[ctFreqNew$n > 1000]
+
+cellsBelow1000 <- scTSMetadata %>%
+  subset(.[[clusterToUse]] %in% setdiff(ctFreqNew$Celltype, ctAbove1000)) %>%
+  rownames()
+
+for(n in nSeurat) {
+  sampledCells <- c()
+  
+  for(cell in ctAbove1000) {
+    rows <- scTSMetadata %>%
+      subset(.[[clusterToUse]] == cell) %>%
+      sample_n(1000) %>%
+      rownames()
+    
+    sampledCells <- c(sampledCells, rows)
+  }
+  name <- paste0("cellsToInclude", n)
+  
+  assign(name, c(cellsBelow1000, sampledCells))
+}
+
+for(n in nSeurat) {
+  list <- get(paste0("cellsToInclude", n))
+  objName <- paste0("scTSCluster", gsub("cluster", "", clusterToUse), n)
+  
+  obj <- subset(scTS, cells = list)
+  Idents(obj) <- obj@meta.data[[clusterToUse]]
+
+  assign(objName, obj)
+}
+```
+
+```{r}
+rm(obj, scTS)
+gc()
+```
+
+# 2.4 Integration of bulk RNA-seq and scRNA-seq data
+
+------------------------------------------------------------------------
+
+```{r}
+bulkToMatch <- read_rds("data/preprocessed_data/bACSccfRNA.rds") # MODIFY HERE
+
+aeRefToUse <- FALSE # MODIFY HERE
+
+# Filter bulk RNA-seq data on overlapping genes
+if(aeRefToUse) {
+  genesToKeep <- intersect(rownames(scAEplaqueFilterFreq), bulkToMatch$symbol)
+  
+  bulkFinal <- bulkToMatch %>%
+    filter(symbol %in% genesToKeep) %>%
+    column_to_rownames("symbol") %>%
+    select(-ensembl_gene_id)
+} else {
+  genesToKeep <- intersect(rownames(get(paste0("scTS", str_to_title(clusterToUse), 1))), bulkToMatch$ensembl_gene_id)
+  
+  geneMap <- bulkToMatch %>%
+    filter(ensembl_gene_id %in% genesToKeep) %>%
+    select(ensembl_gene_id, symbol)
+  
+  map <- setNames(geneMap$symbol, geneMap$ensembl_gene_id)
+  
+  bulkFinal <- bulkToMatch %>%
+    filter(ensembl_gene_id %in% genesToKeep) %>%
+    column_to_rownames("symbol") %>%
+    select(-ensembl_gene_id)
+}
+
+# Filter scRNA-seq data on overlapping genes
+if(aeRefToUse) {
+  scAEplaqueFilterGenes <- subset(scAEplaqueFilterFreq, features = genesToKeep)
+} else {
+  for(n in nSeurat) {
+    obj <- get(paste0("scTSCluster", gsub("cluster", "", clusterToUse), n))
+    objSubset <- subset(obj, features = genesToKeep)
+  
+    newObjName <- paste0("scTSClusterFilterGenes", gsub("cluster", "", clusterToUse), n)
+    assign(newObjName, objSubset)
+  }
+}
+
+gc()
+```
+
+# 2.5 Prepare files for cellular deconvolution
+
+```{r}
+# Generate count files with gene symbols
+if(aeRefToUse) {
+  scAECounts <- scAEplaqueFilterGenes[["RNA"]]$counts %>%
+    as.data.frame() %>%
+    t()
+} else {
+  for(n in nSeurat) {
+    obj <- get(paste0("scTSClusterFilterGenes", gsub("cluster", "", clusterToUse), n))
+    countsName <- paste0("scTSCounts", gsub("cluster", "", clusterToUse), n)
+    
+    counts <- obj[["RNA"]]$counts %>%
+    as.data.frame() %>%
+    t()
+    
+    colnames(counts) <- map[colnames(counts)]
+    assign(countsName, counts)
+    }
+}
+```
+
+## 2.5.1 Scaden
+
+```{r}
+# Generate cell type files
+if(aeRefToUse) {
+  scAECellTypes <- scAEplaqueFilterGenes@meta.data %>%
+    select(cluster7) %>%
+    rename("Celltype" = "cluster7")
+} else {
+  for(n in nSeurat) {
+    obj <- get(paste0("scTSClusterFilterGenes", gsub("cluster", "", clusterToUse), n))
+    celltypesName <- paste0("scTSCellTypes", gsub("cluster", "", clusterToUse), n)
+    
+    celltypes <- Idents(obj) %>%
+      as.data.frame() %>%
+      rename(., Celltype = `.`)
+    
+    assign(celltypesName, celltypes)
+    }
+}
+
+# table(rownames(scAECounts) == rownames(scAECellTypes))
+table(rownames(scTSCounts171) == rownames(scTSCellTypes171))
+```
+
+### 2.5.1.1 Export files
+
+```{r}
+patternBulk <- "rTS_bACSccfRNA" # MODIFY HERE
+patternRef <- "rTS_bACSccfRNA_c17_v1" # MODIFY HERE
+
+if(aeRefToUse) {
+  cellTypesToExport <- "scAECellTypes"
+  countsToExport <- "scAECounts"
+} else {
+  cellTypesToExport <- "scTSCellTypes171" # MODIFY HERE
+  countsToExport <- "scTSCounts171" # MODIFY HERE
+}
+
+pathRef <- paste0("data/processed_data/scaden_sc_rna_ref_files/", patternRef, "/")
+
+if (!file.exists(pathRef)) {
+  dir.create(pathRef)
+  print("Folder created.")
+} else {
+  print("Folder already exists.")
+}
+
+write.table(bulkFinal,
+            file = paste0("data/processed_data/scaden_bulk_rna_files/", patternBulk, "_bulk_data.txt"),
+            sep = "\t")
+
+write.table(get(cellTypesToExport),
+            file = paste0(pathRef, patternRef, "_celltypes.txt"),
+            sep = "\t", row.names = FALSE)
+
+write.table(get(countsToExport),
+            file = paste0(pathRef, patternRef, "_counts.txt"),
+            sep = "\t", row.names = FALSE)
+```
+
+## 2.5.2 BayesPrism
+
+```{r}
+if(aeRefToUse) {
+  metadata <- scAEplaqueFilterGenes@meta.data
+  
+  cellProfile <- metadata %>%
+    select(cluster7, cluster25) %>%
+    rownames_to_column("cell.ID") %>%
+    rename(cell.type = cluster7) %>%
+    rename(cell.subtype = cluster25) %>%
+    mutate(cell.state = "0") %>%
+    na.omit()
+} else {
+  metadata <- scTSClusterFilterGenes171@meta.data # MODIFY HERE
+  
+  if(clusterToUse == "cluster13") {
+    cellProfile <- metadata %>%
+      select(!!rlang::sym(clusterToUse), cluster17) %>%
+      rownames_to_column("cell.ID") %>%
+      rename(cell.type = !!rlang::sym(clusterToUse)) %>%
+      rename(cell.subtype = cluster17) %>%
+      mutate(cell.state = "0") %>%
+      na.omit()
+  } else {
+    cellProfile <- metadata %>%
+      select(!!rlang::sym(clusterToUse)) %>%
+      rownames_to_column("cell.ID") %>%
+      mutate(cell.type = !!rlang::sym(clusterToUse),
+             cell.subtype = !!rlang::sym(clusterToUse),
+             cell.state = "0") %>%
+      select(-!!rlang::sym(clusterToUse)) %>%
+      na.omit()
+  }
+}
+
+# table(rownames(scAECounts) == cellProfile$cell.ID)
+table(rownames(scTSCounts171) == cellProfile$cell.ID)
+```
+
+### 2.5.2.1 Export files
+
+```{r}
+pattern <- "rTS_bAEccfRNA1_c17_v1" # MODIFY HERE
+
+if(aeRefToUse) {
+  countsToExport <- "scAECounts"
+} else {
+  countsToExport <- "scTSCounts171" # MODIFY HERE
+}
+
+path <- paste0("data/processed_data/bayesprism_files/", pattern, "/")
+
+if (!file.exists(path)) {
+  dir.create(path)
+  print("Folder created.")
+} else {
+  print("Folder already exists.")
+}
+
+saveRDS(bulkFinal, file = paste0(path, pattern, "_bulk_data.rds"))
+saveRDS(as.data.frame(t(get(countsToExport))), file = paste0(path, pattern, "_counts.rds"))
+write.csv(cellProfile, file = paste0(path, pattern, "_cell_profile.txt"), row.names = FALSE)
+```
+
+# 2.6 Graphs
+
+## 2.6.1 UMAP
+
+```{r}
+tiff(paste0("output/plots/umap/TS_cluster_17_presentation.tiff"), width = 12, height = 8, units = "in", res = 300)
+
+DimPlot_scCustom(tsCluster171,
+                 reduction = "umap",
+                 label.box = TRUE,
+                 label.size = 4,
+                 repel = TRUE)
+
+dev.off()
+```
+
+## 2.6.2 Sankey diagram
+
+```{r}
+metadata <- tsCluster171@meta.data %>%
+  select(tissue_in_publication, cluster17)
+
+tsOrgan171 <- as.data.frame(table(metadata)) %>%
+  filter(Freq >= 50)
+
+nodes <- data.frame(
+  name = c(as.character(tsOrgan171$cluster17), 
+           as.character(tsOrgan171$tissue_in_publication)) %>% 
+              unique()
+)
+
+tsOrgan171$IDsource <- match(tsOrgan171$cluster17, nodes$name)-1
+tsOrgan171$IDtarget <- match(tsOrgan171$tissue_in_publication, nodes$name)-1
+
+p <- networkD3::sankeyNetwork(
+  Links = tsOrgan171,
+  Nodes = nodes,
+  Source = "IDsource",
+  Target = "IDtarget",
+  Value = "Freq",
+  NodeID = "name",
+  sinksRight = FALSE,
+  fontSize = 12
+)
+
+print(p)
+
+htmlwidgets::saveWidget(p, file="output/plots/sankey_html/tsCluster171_presentation.html")
+```
+
+# 2.7 Session info
+
+```{r}
+devtools::session_info()
+```

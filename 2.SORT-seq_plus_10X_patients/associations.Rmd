@@ -1,0 +1,934 @@
+---
+title: "article_figures"
+author: "Yayuan Zhu"
+date: "2024-07-31"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1. Libraries
+
+```{r}
+library(tidyverse)
+library(rlang)
+
+library(survival)
+library(ranger)
+
+library(RColorBrewer)
+library(survminer)
+library(pROC)
+library(patchwork)
+library(extrafont)
+# font_import(pattern = "Helvetica")
+# font_import(pattern = "Helvetica-Bold")
+loadfonts(device = "postscript", quiet = TRUE)
+
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+```
+
+# 2. Preprocess data
+
+```{r}
+patientData <- haven::read_sav("raw_data/AE_patient_data_20230803.sav") %>%
+  rename(Patient = STUDY_NUMBER)
+
+patientData$Patient <- gsub("^", "ae", patientData$Patient)
+
+# ---- Add the Symptoms.2g column
+patientData$Symptoms.2g <- case_when(patientData$Symptoms.4g == 0 | patientData$Symptoms.4g == 1~0,
+                                     patientData$Symptoms.4g == 2 | patientData$Symptoms.4g == 3~1)
+
+labelled::val_labels(patientData$Symptoms.2g) <- c(mild = 0, severe = 1)
+```
+
+The Scaden predictions of the cellular proportions can be modified in multiple ways. Change variables according to own needs at locations with `# MODIFY HERE` .
+
+-   `combineMacrophageSubsets` : combine the different macrophage subsets.
+
+    -   For paragraph 4, this should be `TRUE` .
+
+    -   Applies only to Gemma's data.
+
+-   `logProportion` (in 3.1): uses the log of the predicted cellular proportions in the formulas of the Cox regression.
+
+    -   First attempt to try and gain more reasonable HR values (instead of e.g. a value of $10^8$).
+
+    -   Not implemented for GLM as Z-scores are/seem to be the way to go.
+
+-   `zTransform` : transform the predicted cellular proportions to Z-scores.
+
+    -   Recommended to always be `TRUE` .
+
+-   `proportionsAsFractions` : have the predicted cellular proportions as fractions.
+
+    -   Only makes a difference in the $\beta$ - coefficients of GLM from non-transformed data.
+
+    -   Figures were made using `proportionsAsFractions = TRUE` out of personal preference.
+
+```{r}
+combineMacrophageSubsets <- TRUE # MODIFY HERE
+proportionsAsFractions <- TRUE # MODIFY HERE
+zTransform <- TRUE # MODIFY HERE
+```
+
+```{r}
+# Gemma's predicted proportions with AE as scRNA-seq reference (default proportions as percentages)
+aePred <- read.csv("raw_data/propsScaden_10runs_4macros.csv")
+
+# Optional modifications
+aePredMod <- aePred
+
+  # < Combine macrophage subsets >
+if(combineMacrophageSubsets) {
+  aePredMod <- aePredMod %>%
+    mutate(Macrophages = rowSums(select(., "LAM", "Resident_Macrophages", "Inflammatory_Macrophages", "Foamy_Macrophages"))) %>%
+    select(-c("LAM", "Resident_Macrophages", "Inflammatory_Macrophages", "Foamy_Macrophages"))
+}
+
+  # < Convert proportions to fractions >
+if(proportionsAsFractions) {
+  aePredMod <- aePredMod %>%
+    mutate(across(-Patient, ~ . / 100))
+}
+
+  # < Transform predicted cellular proportions to Z scores >
+if(zTransform) {
+  aePredMod <- aePredMod %>%
+    mutate(across(-Patient, ~ c(scale(.))))
+}
+
+# Add patient characteristics
+aePredSymp <- aePredMod %>%
+  left_join(patientData, by = "Patient")
+```
+
+```{r}
+# Yayuan's predicted proportions with Tabula Sapiens as scRNA-seq reference (default proportions as fractions)
+tsPred <- readRDS("raw_data/scaden_avg_prop_rTS_bAEplaque1_c10.rds") %>%
+  pivot_wider(names_from = Celltype, values_from = `Average proportion`)
+
+# Optional modification
+tsPredMod <- tsPred
+
+  # < Convert proportions to percentages >
+if(!proportionsAsFractions) {
+  tsPredMod <- tsPredMod %>%
+    mutate(across(-Patient, ~ . * 100))
+}
+
+  # < Transform predicted cellular proportions to Z scores >
+if(zTransform) {
+  tsPredMod <- tsPredMod %>%
+    mutate(across(-Patient, ~ c(scale(.))))
+}
+
+# Add patient characteristics
+tsPredSymp <- tsPredMod %>%
+  left_join(patientData, by = "Patient")
+
+# Change colnames to match aePred
+colnames(tsPredSymp)[2:11] <- gsub("/", "_", colnames(tsPredSymp)[2:11])
+colnames(tsPredSymp)[2:11] <- gsub(" ", "_", colnames(tsPredSymp)[2:11])
+```
+
+```{r}
+# For comparison between the two, only use overlapping patients
+overlapPatients <- intersect(aePredSymp$Patient, tsPredSymp$Patient)
+
+aePredSympFilter <- aePredSymp %>%
+  filter(Patient %in% overlapPatients)
+```
+
+```{r}
+rm(aePred, aePredMod, tsPred, tsPredMod, overlapPatients)
+```
+
+# 3. Reference: AtheroExpress
+
+## 3.1 Figure 5E: Cox regression
+
+### 3.1.1 Cox regression analysis
+
+```{r}
+# Cell types and covariates to include in the Cox regression analysis
+cellTypes <- colnames(aePredSymp)[2:9] # MODIFY HERE
+
+covariates <- c() # MODIFY HERE
+
+logProportion <- FALSE # MODIFY HERE
+
+# Perform the Cox regression analysis
+formulas <- sapply(cellTypes, function(x) {
+  if(logProportion) {
+    if(is.null(covariates)) {
+      as.formula(sprintf("Surv(EP_major_time, EP_major) ~ log(%s)", x))
+    } else {
+      as.formula(sprintf("Surv(EP_major_time, EP_major) ~ log(%s) + %s", x, paste(covariates, collapse = " + ")))
+    }
+  } else {
+    if(is.null(covariates)) {
+      as.formula(sprintf("Surv(EP_major_time, EP_major) ~ %s", x))
+    } else {
+      as.formula(sprintf("Surv(EP_major_time, EP_major) ~ %s + %s", x, paste(covariates, collapse = " + ")))
+    }
+  }
+})
+
+resCox <- lapply(formulas, function(f) {
+  coxModel <- tryCatch(coxph(f, data = aePredSymp), 
+                       error = function(e) {
+                         message("Cox regression failed for formula: ", deparse(f))
+                       })
+})
+
+lapply(resCox, function(r) summary(r))
+
+# Extract results from the Cox regression analysis
+dfResCox <- lapply(resCox, function(x) {
+  res <- summary(x)
+
+  df <- data.frame(beta = signif(res$coef[1], digits = 3), # coef
+                   se_beta = signif(res$coef[3], digits = 2), # se(coef)
+                   HR = signif(res$coef[2], digits = 2),
+                   CI_lower = signif(res$conf.int[, "lower .95"], digits = 2),
+                   CI_upper = signif(res$conf.int[, "upper .95"], digits = 3),
+                   p = sprintf("%.3f", res$wald["pvalue"]),
+                   concordance = signif(res$concordance[["C"]], digits = 2),
+                   p_likelihood_test = signif(res$logtest[["pvalue"]], digits = 2),
+                   p_wald_test = signif(res$waldtest[["pvalue"]], digits = 2),
+                   p_score_test = signif(res$sctest[["pvalue"]], digits = 2),
+                   check.names = FALSE)
+  return(df)
+})
+
+dfAllResCox <- do.call(rbind, dfResCox) %>%
+  rownames_to_column("Cell type") %>%
+  mutate(`Cell type` = factor(`Cell type`, levels = unique(`Cell type`)))
+
+dfAllResCox$`HR [95%CI]` <- sprintf("%.2f [%.2f - %.2f]", dfAllResCox$HR, dfAllResCox$CI_lower, dfAllResCox$CI_upper)
+
+dfAllResCox$Sig. <- ifelse(dfAllResCox$p < 0.05, "*", "")
+```
+
+### 3.1.2 Validate Cox regression analysis
+
+The conclusions written below for this paragraph are based on data which are not log nor Z transformed. However, they result in the same conclusions for the different tests.
+
+#### 3.1.2.1 Testing proportional hazards assumption
+
+```{r}
+testCoxAssump <- lapply(resCox, function(r) cox.zph(r))
+print(testCoxAssump)
+
+pTestCoxAssump <- lapply(testCoxAssump, function(t) ggcoxzph(t))
+invisible(lapply(pTestCoxAssump, print))
+```
+
+Of the different univariate Cox regression analyses using different cell types, no significant p-values were found. Additionally, the graphs displayed flat lines with no clear trend and minor deviations of the individual points. Therefore, the assumption of the Cox model, "whether the effect of a covariate on the hazard is constant over time", holds true.
+
+#### 3.1.2.2 Testing influential observations
+
+```{r}
+lapply(resCox, function(r) ggcoxdiagnostics(r, type = "martingale") + labs(title = r))
+```
+
+The plotted lines are pretty horizontal with a few acceptable exceptions (e.g. SMCs or resident macrophages). Quite a lot of observations are close to 1, indicating that these observations with events were poorly predicted by the model. These observations occurred unexpectedly early. For the negative values, they are relatively small negative values. Notably, these values all form a negative linear line. The formation of these two groups may be a sign of heteroscedasticity or be a result of the univariate analysis.
+
+```{r}
+lapply(resCox, function(r) ggcoxdiagnostics(r, type = "deviance") + labs(title = r))
+```
+
+For the "deviance" plots, the residuals are not scattered randomly around zero. Rather, they show the same grouping as the previous plot type. This indicated that the univariate model does not adequately capture the relationship with the MACE hazard.
+
+```{r}
+lapply(resCox, function(r) ggcoxdiagnostics(r, type = "dfbeta"))
+```
+
+The majority of the observations are scattered around the flat line. This suggest that none of the observations are terribly influential individually.
+
+```{r}
+lapply(resCox, function(r) ggcoxdiagnostics(r, type = "scaledsch"))
+```
+
+The individual observations all seem to be randomly scattered around 0. However there does seem to be a curved trend line with two bumps. This "indicates that the proportional hazards assumption might not hold". This contradicts the conclusion made in 4.2.1.
+
+#### 3.1.2.3 Testing non-linearity
+
+```{r}
+lapply(resCox, function(r) ggcoxfunctional(r))
+```
+
+In the univariate Cox models, there is non-linearity in all of them. The relationship between the covariate and the hazard rate is not adequately captured by the used linear term.
+
+### 3.1.3 Forest plot
+
+```{r}
+plotResCox <- dfAllResCox
+
+if(combineMacrophageSubsets) {
+  cellTypeMap <- c("T_Cells" = "T cells",
+                   "B_Cells" = "B cells",
+                   "Smooth_Muscle_Cells" = "Smooth muscle cells",
+                   "Endothelial_Cells" = "Endothelial cells",
+                   "NK_Cells" = "NK cells",
+                   "Dendritic_Cells" = "Dendritic cells",
+                   "Mastocytes" = "Mastocytes",
+                   "Foamy_Macrophages" = "Foamy macrophages")
+} else {
+  cellTypeMap <- c("T_Cells" = "T cells",
+                 "LAM" = "LAMs",
+                 "B_Cells" = "B cells",
+                 "Smooth_Muscle_Cells" = "Smooth muscle cells",
+                 "Endothelial_Cells" = "Endothelial cells",
+                 "Resident_Macrophages" = "Resident macrophages",
+                 "NK_Cells" = "NK cells",
+                 "Inflammatory_Macrophages" = "Inflammatory macrophages",
+                 "Dendritic_Cells" = "Dendritic cells",
+                 "Mastocytes" = "Mastocytes",
+                 "Foamy_Macrophages" = "Foamy macrophages")
+}
+
+plotResCox <- plotResCox %>%
+  mutate(`Cell type` = recode(`Cell type`, !!!cellTypeMap))
+```
+
+```{r}
+# https://rpubs.com/mbounthavong/forest_plots_r
+# Create the base plot for the different text columns
+baseCol <- ggplot(plotResCox, aes(y = `Cell type`)) +
+  theme(text = element_text(family = "Helvetica"),
+        plot.title = element_text(size = 10, face = "bold", vjust = -1),
+        axis.text.x = element_text(color = "white", hjust = -3),
+        axis.line = element_blank(),
+        axis.title.x = element_blank(),
+        axis.text.y = element_blank(), 
+        axis.ticks = element_blank(),
+        axis.title.y = element_blank(), 
+        legend.position = "none",
+        panel.background = element_blank(), 
+        panel.border = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        plot.background = element_blank())
+
+pCellType <- baseCol +
+  geom_text(aes(x = -Inf, label = `Cell type`), hjust = 0, size = 3, family = "Helvetica") +
+  ggtitle("Cell type") +
+  annotate("text", x = 0, y = Inf, label = "") +
+  theme(plot.title = element_text(hjust = 0))
+
+pForest <- ggplot(plotResCox, aes(x = `Cell type`, y = HR)) +
+  geom_hline(yintercept = 1, linewidth = 0.3, color = "#878787") +
+  geom_errorbar(aes(ymin = CI_lower, ymax = CI_upper, color = Sig.), width = NA, linewidth = 0.3) +
+  geom_point(aes(color = Sig.), shape = 22, size = 2, stroke = 0.8) +
+  geom_point(aes(fill = Sig.), shape = 22, size = 2.2, stroke = NA) + 
+  coord_flip() +
+  labs(x = "",
+       color = expression(bold(significant))) +
+  scale_color_manual(values = c("#878787", "#4848F7")) + # Colors for the outlines
+  scale_fill_manual(values = c("black", "#FF0000")) + # Colors for the squares
+  guides(color = "none",
+         fill = "none",
+         x = guide_axis(cap = "both")) +
+  theme_classic() +
+  theme(text = element_text(family = "Helvetica", size = 10),
+        axis.line.y = element_blank(),
+        axis.ticks.y= element_blank(),
+        axis.text.y= element_blank(),
+        axis.title.y= element_blank(),
+        axis.ticks.length.x = unit(0.2, "cm"),
+        axis.line = element_line(color = "#878787", linewidth = 0.3),
+        axis.ticks = element_line(color = "#878787", linewidth = 0.3),
+        panel.background = element_blank(),
+        plot.background = element_blank())
+
+pHR <- baseCol +
+  geom_text(aes(x = 0, label = `HR [95%CI]`), hjust = 0.5, size = 3, family = "Helvetica") +
+  ggtitle("HR [95% CI]") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+pPValue <- baseCol +
+  geom_text(aes(x = 0, label = p), hjust = 0.5, size = 3, family = "Helvetica") +
+  ggtitle("p") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+pSig <- baseCol +
+  geom_text(aes(x = 0, label = `Sig.`), hjust = 0.5, size = 3, family = "Helvetica") +
+  ggtitle("Sig.") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+#### 3.1.3.1 Using formula "Surv(EP_major_time, EP_major) \~ log(%s)" and macrophage subsets
+
+```{r}
+pForest <- pForest +
+  labs(y = expression(bold("Hazard Ratio (log-transformed covariate)"))) +
+  scale_y_continuous(limits = c(0, 3),
+                     breaks = seq(0, 3, 1))
+```
+
+```{r}
+pdf("AtheoExpress_ref/figure5E_deconv_log_frac_subsets_a4.pdf", width = 7, height = 3.3, paper = "a4")
+
+pCellType + pForest + pHR + pPValue + pSig + plot_layout(design = c(area(t = 0, l = 0, b = 5, r = 31),
+                                                                    area(t = 0, l = 27, b = 5, r = 72),
+                                                                    area(t = 0, l = 72, b = 5, r = 90),
+                                                                    area(t = 0, l = 90, b = 5, r = 95),
+                                                                    area(t = 0, l = 95, b = 5, r = 100)))
+
+dev.off()
+```
+
+#### 3.1.3.2 Using formula "Surv(EP_major_time, EP_major) \~ log(%s)" and combined macrophage subsets
+
+```{r}
+pForest <- pForest +
+  labs(y = expression(bold("Hazard Ratio (log-transformed covariate)"))) +
+  scale_y_continuous(limits = c(0, 5),
+                     breaks = seq(0, 5, 1))
+```
+
+```{r}
+pdf("AtheoExpress_ref/figure5E_deconv_log_frac_combine_a4.pdf", width = 6.5, height = 2.5, paper = "a4")
+
+pCellType + pForest + pHR + pPValue + pSig + plot_layout(design = c(area(t = 0, l = 0, b = 5, r = 21),
+                                                                    area(t = 0, l = 21, b = 5, r = 72),
+                                                                    area(t = 0, l = 72, b = 5, r = 90),
+                                                                    area(t = 0, l = 90, b = 5, r = 95),
+                                                                    area(t = 0, l = 95, b = 5, r = 100)))
+
+dev.off()
+```
+
+#### 3.1.3.3 Using formula "Surv(EP_major_time, EP_major) \~ %s" and macrophage subsets
+
+```{r}
+pForest <- pForest +
+  labs(y = expression(bold("Hazard Ratio"))) +
+  scale_y_continuous(limits = c(0.5, 1.5),
+                     breaks = seq(0.5, 1.5, 0.5),
+                     labels = c("0.5", "1", "1.5"))
+```
+
+```{r}
+pdf("AtheoExpress_ref/figure5E_deconv_Z_frac_subsets_a4.pdf", width = 5.5, height = 3.3, paper = "a4")
+
+pCellType + pForest + pHR + pPValue + pSig + plot_layout(design = c(area(t = 0, l = 0, b = 5, r = 35),
+                                                                    area(t = 0, l = 35, b = 5, r = 65),
+                                                                    area(t = 0, l = 64, b = 5, r = 90),
+                                                                    area(t = 0, l = 87, b = 5, r = 95),
+                                                                    area(t = 0, l = 95, b = 5, r = 100)))
+
+dev.off()
+```
+
+#### 3.1.3.4 Using formula "Surv(EP_major_time, EP_major) \~ %s" and combined macrophage subsets
+
+```{r}
+pForest <- pForest +
+  labs(y = expression(bold("Hazard Ratio"))) +
+  scale_y_continuous(limits = c(0.5, 2),
+                     breaks = seq(0.5, 2, 0.5),
+                     labels = c("0.5", "1", "1.5", "2"))
+```
+
+```{r}
+pdf("AtheoExpress_ref/figure5E_deconv_Z_frac_combine_a4.pdf", width = 5.5, height = 2.3, paper = "a4")
+
+pCellType + pForest + pHR + pPValue + pSig + plot_layout(design = c(area(t = 0, l = 0, b = 5, r = 26),
+                                                                    area(t = 0, l = 27, b = 5, r = 62),
+                                                                    area(t = 0, l = 61, b = 5, r = 85),
+                                                                    area(t = 0, l = 85, b = 5, r = 89),
+                                                                    area(t = 0, l = 87, b = 5, r = 100)))
+
+dev.off()
+```
+
+## 3.2 Supplementary Figure 5B: GLM
+
+The data used below have been Z transformed and use either fractions or percentages for the predicted cellular proportions.
+
+### 3.2.1 Fit GLM
+
+```{r}
+# Cell types and covariates to include in the general linear model
+cellTypes <- colnames(aePredSympFilter)[2:9] # MODIFY HERE
+
+covariates <- c() # MODIFY HERE
+
+# Fit generalized linear models
+formulas <- sapply(cellTypes, function(x) {
+  if(length(covariates) > 0) {
+    as.formula(paste("Symptoms.2g ~", x, "+", paste(covariates, collapse = " + ")))
+  } else {
+    as.formula(paste("Symptoms.2g ~", x))
+  }})
+
+resAEglm <- lapply(formulas, function(x) glm(x, family = binomial, data = aePredSympFilter))
+
+# Extract values from all fitted models
+dfResAEglm <- lapply(resAEglm, function(x) {
+  res <- summary(x)
+  
+  df <- data.frame(beta = signif(res$coef[2], digits = 3),
+                   se_beta = signif(res$coef[4], digits = 3),
+                   p_value = signif(res$coef[8], digits = 3),
+                   null_deviance = res$null.deviance,
+                   res_deviance = res$deviance,
+                   AIC = res$aic,
+                   check.names = FALSE)
+  return(df)
+})
+
+allAEglm <- do.call(rbind, dfResAEglm) %>%
+  rownames_to_column("Cell type") %>%
+  mutate(`Cell type` = factor(`Cell type`, levels = unique(`Cell type`)),
+         sig = ifelse(p_value < 0.05, "yes", "no"),
+         CI_lower = beta - 1.96 * se_beta,
+         CI_upper = beta + 1.96 * se_beta)
+```
+
+### 3.2.2 Validate GLM
+
+#### 3.2.2.1 Residual plots
+
+```{r}
+lapply(names(resAEglm), function(name) {
+  par(mfrow = c(2, 2))
+  plot(resAEglm[[name]], main = name)
+})
+```
+
+Residuals vs Fitted: all models display two lines parallel to each other with the trend line in between. Additionally, some models show a negative slope.
+
+Q-Q Residuals: models which were found non-significant show the formation of two groups while the ones that were significant display a logistic line.
+
+Scale-Location: all models display two lines. For the ones that were significant, the two lines either cross each other or are close to. The models that were not significant are mostly parallel.
+
+Residuals vs Leverage: all models display two lines. For the ones that were significant, the two lines have a strong curve outwards. The models that were not significant were similar but to a lesser extent.
+
+#### 3.2.2.2 ROC
+
+```{r}
+aeListROC <- lapply(resAEglm, function(m) {
+  prediction <- predict(m, aePredSympFilter[1:9], type = "response")
+  
+  rocCurve <- roc(aePredSympFilter$Symptoms.2g, prediction)
+  
+  return(rocCurve)
+})
+```
+
+```{r}
+par(mar = c(5, 4 ,4, 8), xpd = TRUE, pty = "s")
+plot(aeListROC[[1]], col = 1, print.auc = TRUE, print.auc.y = 0.44, legacy.axes = TRUE)
+
+for (i in 2:length(aeListROC)) {
+  aucY <- 0.5 - (i * 0.06)
+  plot(aeListROC[[i]], col = i, print.auc = TRUE, print.auc.y = aucY, add = TRUE)
+}
+
+legend("bottomright", inset=c(-0.57, -0.02), 
+       legend = colnames(aePredSympFilter)[2:9], col = 1:length(aeListROC), 
+       lwd = 2, box.lty = 0, cex = 0.73, bg = NA)
+```
+
+For the univariate GLM, dendritic cells seem to have the best AUC (0.613). However, the AUC values are relatively close to each other and are all just slightly better predictors than randomly guessing.
+
+### 3.2.2 Forest plot
+
+```{r}
+plotResAEglm <- allAEglm
+  
+plotResAEglm$`Cell type` <- gsub("_", " ", plotResAEglm$`Cell type`)
+```
+
+```{r}
+pAEglm <- ggplot(plotResAEglm, aes(x = `Cell type`, y = beta)) +
+  geom_errorbar(aes(ymin = CI_lower, ymax = CI_upper, color = sig), 
+                width = 0.2, size = 1, linewidth = 0.6) +
+  geom_point(aes(fill = sig), shape = 21, size = 2, stroke = NA) +
+  geom_hline(yintercept = 0, linetype = "dotted", linewidth = 0.2) +
+  coord_flip() +
+  labs(x = "",
+       y = expression(beta ~ "coefficient (" * bold(symptomatic) * ")"),
+       color = expression(bold(significant))) +
+  scale_color_manual(values = c("#7C7C7C", "#00868B")) +
+  scale_fill_manual(values = c("black", "#00868B")) +
+  scale_y_continuous(limits = c(-0.6, 0.5),
+                     breaks = seq(-0.5, 0.5, 0.25),
+                     labels = c("-0.5", "-0.25", "0", "0.25", "0.5")) +
+  guides(color = guide_legend(override.aes = list(shape = NA, linewidth = 0.6)),
+         fill = "none") +
+  theme_bw(base_family = "Helvetica") +
+  theme(panel.border = element_rect(size = 0.4, color = "black"),
+        panel.grid.major = element_line(size = 0.2),
+        axis.ticks = element_line(size = 0.2),
+        axis.ticks.length = unit(0.04, "cm"),
+        axis.title = element_text(size = 6),
+        axis.text = element_text(size = 6),
+        legend.margin = margin(l = -3),
+        legend.title = element_text(size = 6, margin = margin(l = -6)),
+        legend.text = element_text(size = 6),
+        legend.key.size = unit(0.26, "cm"),
+        aspect.ratio = 1)
+```
+
+```{r}
+pdf("AtheoExpress_ref/figureS5B_AE_deconv_Z_frac.pdf", width = 4, height = 2.5)
+
+pAEglm
+
+dev.off()
+```
+
+# 4. Reference: Tabula Sapiens
+
+## 4.1 Figure 5E: Cox regression
+
+### 4.1.1 Cox regression analysis
+
+```{r}
+# Cell types and covariates to include in the Cox regression analysis
+cellTypes <- colnames(tsPredSymp)[2:11] # MODIFY HERE
+
+covariates <- c() # MODIFY HERE
+
+# Perform the Cox regression analysis
+formulas <- sapply(cellTypes, function(x) {
+  if(is.null(covariates)) {
+    as.formula(sprintf("Surv(EP_major_time, EP_major) ~ %s", x))
+  } else {
+    as.formula(sprintf("Surv(EP_major_time, EP_major) ~ %s + %s", x, paste(covariates, collapse = " + ")))
+  }
+})
+
+resCox <- lapply(formulas, function(f) {
+  coxModel <- tryCatch(coxph(f, data = tsPredSymp), 
+                       error = function(e) {
+                         message("Cox regression failed for formula: ", deparse(f))
+                       })
+})
+
+lapply(resCox, function(r) summary(r))
+
+# Extract results from the Cox regression analysis
+dfResCox <- lapply(resCox, function(x) {
+  res <- summary(x)
+
+  df <- data.frame(beta = signif(res$coef[1], digits = 3), # coef
+                   se_beta = signif(res$coef[3], digits = 2), # se(coef)
+                   HR = signif(res$coef[2], digits = 2),
+                   CI_lower = signif(res$conf.int[, "lower .95"], digits = 2),
+                   CI_upper = signif(res$conf.int[, "upper .95"], digits = 3),
+                   p = sprintf("%.3f", res$wald["pvalue"]),
+                   concordance = signif(res$concordance[["C"]], digits = 2),
+                   p_likelihood_test = signif(res$logtest[["pvalue"]], digits = 2),
+                   p_wald_test = signif(res$waldtest[["pvalue"]], digits = 2),
+                   p_score_test = signif(res$sctest[["pvalue"]], digits = 2),
+                   check.names = FALSE)
+  return(df)
+})
+
+dfAllResCox <- do.call(rbind, dfResCox) %>%
+  rownames_to_column("Cell type") %>%
+  mutate(`Cell type` = factor(`Cell type`, levels = unique(`Cell type`)))
+
+dfAllResCox$`HR [95%CI]` <- sprintf("%.2f [%.2f - %.2f]", dfAllResCox$HR, dfAllResCox$CI_lower, dfAllResCox$CI_upper)
+
+dfAllResCox$Sig. <- ifelse(dfAllResCox$p < 0.05, "*", "")
+```
+
+### 4.1.2 Validate Cox regression analysis
+
+#### 4.1.2.1 Testing proportional hazards assumption
+
+```{r}
+testCoxAssump <- lapply(resCox, function(r) cox.zph(r))
+print(testCoxAssump)
+
+pTestCoxAssump <- lapply(testCoxAssump, function(t) ggcoxzph(t))
+invisible(lapply(pTestCoxAssump, print))
+```
+
+Of the different univariate Cox regression analyses using different cell types, no significant p-values were found. Additionally, the graphs displayed flat lines with no clear trend and minor deviations of the individual points. Therefore, the assumption of the Cox model, "whether the effect of a covariate on the hazard is constant over time", holds true.
+
+#### 4.1.2.2 Testing influential observations
+
+```{r}
+lapply(resCox, function(r) ggcoxdiagnostics(r, type = "martingale") + labs(title = r))
+```
+
+```{r}
+lapply(resCox, function(r) ggcoxdiagnostics(r, type = "deviance") + labs(title = r))
+```
+
+```{r}
+lapply(resCox, function(r) ggcoxdiagnostics(r, type = "dfbeta"))
+```
+
+```{r}
+lapply(resCox, function(r) ggcoxdiagnostics(r, type = "scaledsch"))
+```
+
+#### 4.1.2.3 Testing non-linearity
+
+```{r}
+lapply(resCox, function(r) ggcoxfunctional(r))
+```
+
+### 4.1.3 Forest plot
+
+```{r}
+plotResTSCox <- dfAllResCox
+
+cellTypeMapCox <- c("B_cell" = "B Cells",
+                    "Basophil_mast_cell" = "Basophils and Mast Cells",
+                    "Endothelial_cell" = "Endothelial Cells",
+                    "Erythrocyte" = "Erythrocytes",
+                    "Mesenchymal_cell_fibroblast" = "Fibroblasts and Mesenchymal Cells",
+                    "Monocyte" = "Monocytes",
+                    "Neutrophil" = "Neutrophils",
+                    "Pericyte_smooth_muscle_cell" = "Pericytes and Smooth Muscle Cells",
+                    "Platelet" = "Platelets",
+                    "T_NK_cell" = "T and NK Cells")
+
+plotResTSCox <- plotResTSCox %>%
+  mutate(`Cell type` = recode(`Cell type`, !!!cellTypeMapCox))
+```
+
+```{r}
+# https://rpubs.com/mbounthavong/forest_plots_r
+# Create the base plot for the different text columns
+baseCol <- ggplot(plotResTSCox, aes(y = `Cell type`)) +
+  theme(text = element_text(family = "Helvetica"),
+        plot.title = element_text(size = 9, face = "bold", vjust = -1),
+        axis.text.x = element_text(color = "white", hjust = -3),
+        axis.line = element_blank(),
+        axis.title.x = element_blank(),
+        axis.text.y = element_blank(), 
+        axis.ticks = element_blank(),
+        axis.title.y = element_blank(), 
+        legend.position = "none",
+        panel.background = element_blank(), 
+        panel.border = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        plot.background = element_blank())
+
+pCellType <- baseCol +
+  geom_text(aes(x = -Inf, label = `Cell type`), hjust = 0, size = 2.5, family = "Helvetica") +
+  ggtitle("Cell type") +
+  annotate("text", x = 0, y = Inf, label = "") +
+  theme(plot.title = element_text(hjust = 0))
+
+pForest <- ggplot(plotResTSCox, aes(x = `Cell type`, y = HR)) +
+  geom_hline(yintercept = 1, linewidth = 0.3, color = "#878787") +
+  geom_errorbar(aes(ymin = CI_lower, ymax = CI_upper, color = Sig.), width = NA, linewidth = 0.3) +
+  geom_point(aes(color = Sig.), shape = 22, size = 1, stroke = 0.8) +
+  geom_point(aes(fill = Sig.), shape = 22, size = 1.2, stroke = NA) + 
+  coord_flip() +
+  labs(x = "",
+       y = expression(bold("Hazard Ratio")),
+       color = expression(bold(significant))) +
+  scale_color_manual(values = c("#878787", "#4848F7")) + # Colors for the outlines
+  scale_fill_manual(values = c("black", "#FF0000")) + # Colors for the squares
+  scale_y_continuous(limits = c(0.5, 1.6),
+                     breaks = seq(0.5, 1.5, 0.5),
+                     labels = c("0.5", "1", "1.5")) +
+  guides(color = "none",
+         fill = "none",
+         x = guide_axis(cap = "both")) +
+  theme_classic() +
+  theme(axis.text.x = element_text(family = "Helvetica", size = 7),
+        axis.title.x = element_text(family = "Helvetica", size = 7),
+        axis.line.y = element_blank(),
+        axis.ticks.y= element_blank(),
+        axis.text.y= element_blank(),
+        axis.title.y= element_blank(),
+        axis.ticks.length.x = unit(0.2, "cm"),
+        axis.line = element_line(color = "#878787", linewidth = 0.3),
+        axis.ticks = element_line(color = "#878787", linewidth = 0.3),
+        panel.background = element_blank(),
+        plot.background = element_blank())
+
+pHR <- baseCol +
+  geom_text(aes(x = 0, label = `HR [95%CI]`), hjust = 0.5, size = 2.5, family = "Helvetica") +
+  ggtitle("HR [95% CI]") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+pPValue <- baseCol +
+  geom_text(aes(x = 0, label = p), hjust = 0.5, size = 2.5, family = "Helvetica") +
+  ggtitle("p") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+pSig <- baseCol +
+  geom_text(aes(x = 0, label = `Sig.`), hjust = 0.5, size = 2.5, family = "Helvetica") +
+  ggtitle("Sig.") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r}
+pdf("Tabula_Sapiens_ref/figure5E_TS_deconv_Z_frac.pdf", width = 4.5, height = 2.2)
+
+pCellType + pForest + pHR + pPValue + pSig + plot_layout(design = c(area(t = 0, l = 0, b = 5, r = 39),
+                                                                    area(t = 0, l = 36, b = 5, r = 57),
+                                                                    area(t = 0, l = 57, b = 5, r = 72),
+                                                                    area(t = 0, l = 69, b = 5, r = 80),
+                                                                    area(t = 0, l = 80, b = 5, r = 80)))
+
+dev.off()
+```
+
+## 4.2 Supplementary Figure 5B: GLM
+
+### 4.2.1 Fit GLM
+
+```{r}
+# Cell types and covariates to include in the general linear model
+cellTypes <- colnames(tsPredSymp)[2:11] # MODIFY HERE
+
+covariates <- c() # MODIFY HERE
+
+# Fit generalized linear models
+formulas <- sapply(cellTypes, function(x) {
+  if(length(covariates) > 0) {
+    as.formula(paste("Symptoms.2g ~", x, "+", paste(covariates, collapse = " + ")))
+  } else {
+    as.formula(paste("Symptoms.2g ~", x))
+  }})
+
+resTSglm <- lapply(formulas, function(x) glm(x, family = binomial, data = tsPredSymp))
+
+# Extract values from all fitted models
+dfResTSglm <- lapply(resTSglm, function(x) {
+  res <- summary(x)
+  
+  df <- data.frame(beta = signif(res$coef[2], digits = 3),
+                   se_beta = signif(res$coef[4], digits = 3),
+                   p_value = signif(res$coef[8], digits = 3),
+                   null_deviance = res$null.deviance,
+                   res_deviance = res$deviance,
+                   AIC = res$aic,
+                   check.names = FALSE)
+  return(df)
+})
+
+allTSglm <- do.call(rbind, dfResTSglm) %>%
+  rownames_to_column("Cell type") %>%
+  mutate(`Cell type` = factor(`Cell type`, levels = unique(`Cell type`)),
+         sig = ifelse(p_value < 0.05, "yes", "no"),
+         CI_lower = beta - 1.96 * se_beta,
+         CI_upper = beta + 1.96 * se_beta)
+```
+
+### 4.2.2 Validate GLM
+
+#### 4.2.2.1 Residual plots
+
+```{r}
+lapply(names(resTSglm), function(name) {
+  par(mfrow = c(2, 2))
+  plot(resTSglm[[name]], main = name)
+})
+```
+
+Residuals vs Fitted: all models display two lines parallel to each other with the trend line in between. Additionally, some models show a negative slope.
+
+Q-Q Residuals: models which were found non-significant show the formation of two groups while the ones that were significant display a logistic line. Notably, monocytes (significant) show a slight formation of two groups.
+
+Scale-Location: all models display two lines. For the ones that were significant, the two lines either cross each other or are close to. The models that were not significant are mostly parallel.
+
+Residuals vs Leverage: all models display two lines. For the ones that were significant, the two lines have a strong curve outwards. The models that were not significant were similar but to a lesser extent. Notably, erythrocytes seem to stray from the average view.
+
+#### 4.2.2.2 ROC
+
+```{r}
+tsListROC <- lapply(resTSglm, function(m) {
+  prediction <- predict(m, tsPredSymp[1:11], type = "response")
+  
+  rocCurve <- roc(tsPredSymp$Symptoms.2g, prediction)
+  
+  return(rocCurve)
+})
+```
+
+```{r}
+colors <- brewer.pal(10, "Paired")
+
+par(mar = c(5, 4, 4, 8), xpd = TRUE, pty = "s")
+plot(tsListROC[[1]], col = colors[1], print.auc = TRUE, print.auc.y = 0.4, print.auc.cex = 0.6, legacy.axes = TRUE)
+
+for (i in 2:length(tsListROC)) {
+  aucY <- 0.49 - (i * 0.045)
+  plot(tsListROC[[i]], col = colors[i], print.auc = TRUE, print.auc.y = aucY, print.auc.cex = 0.6, add = TRUE)
+}
+
+legend("topleft", legend = colnames(tsPredSymp)[2:11], 
+       col = colors, lwd = 2, box.lty = 0, cex = 0.6, bg = NA)
+```
+
+For the univariate GLM, neutrophils seem to have the best AUC (0.592). However, the AUC values are relatively close to each other and are all just slightly better predictors than randomly guessing (except for T/NK cells).
+
+## 4.3 Forest plot
+
+```{r}
+plotResTSglm <- allTSglm
+
+cellTypeMapGLM <- c("B_cell" = "B Cells",
+                    "Basophil_mast_cell" = "Basophils and Mast Cells",
+                    "Endothelial_cell" = "Endothelial Cells",
+                    "Erythrocyte" = "Erythrocytes",
+                    "Mesenchymal_cell_fibroblast" = "Fibroblasts and Mesenchymal Cells",
+                    "Monocyte" = "Monocytes",
+                    "Neutrophil" = "Neutrophils",
+                    "Pericyte_smooth_muscle_cell" = "Pericytes and Smooth Muscle Cells",
+                    "Platelet" = "Platelets",
+                    "T_NK_cell" = "T and NK Cells")
+
+plotResTSglm <- plotResTSglm %>%
+  mutate(`Cell type` = recode(`Cell type`, !!!cellTypeMapGLM))
+```
+
+```{r}
+pTSglm <- ggplot(plotResTSglm, aes(x = `Cell type`, y = beta)) +
+  geom_errorbar(aes(ymin = CI_lower, ymax = CI_upper, color = sig), 
+                width = 0.2, size = 1, linewidth = 0.6) +
+  geom_point(aes(fill = sig), shape = 21, size = 2, stroke = NA) +
+  geom_hline(yintercept = 0, linetype = "dotted", linewidth = 0.2) +
+  coord_flip() +
+  labs(x = "",
+       y = expression(beta ~ "coefficient (" * bold(symptomatic) * ")"),
+       color = expression(bold(significant))) +
+  scale_color_manual(values = c("#7C7C7C", "#00868B")) +
+  scale_fill_manual(values = c("black", "#00868B")) +
+  scale_y_continuous(limits = c(-0.5, 0.5),
+                     breaks = seq(-0.5, 0.5, 0.25),
+                     labels = c("-0.5", "-0.25", "0", "0.25", "0.5")) +
+  guides(color = guide_legend(override.aes = list(shape = NA, linewidth = 0.6)),
+         fill = "none") +
+  theme_bw(base_family = "Helvetica") +
+  theme(panel.border = element_rect(size = 0.4, color = "black"),
+        panel.grid.major = element_line(size = 0.2),
+        axis.ticks = element_line(size = 0.2),
+        axis.ticks.length = unit(0.04, "cm"),
+        axis.title = element_text(size = 6),
+        axis.text = element_text(size = 6),
+        legend.margin = margin(l = -3),
+        legend.title = element_text(size = 6, margin = margin(l = -6)),
+        legend.text = element_text(size = 6),
+        legend.key.size = unit(0.26, "cm"),
+        aspect.ratio = 1)
+```
+
+```{r}
+pdf("Tabula_Sapiens_ref/figureS5B_TS_deconv_Z_frac.pdf", width = 4, height = 2.5)
+
+pTSglm
+
+dev.off()
+```

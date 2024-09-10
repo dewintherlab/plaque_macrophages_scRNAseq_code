@@ -1,0 +1,106 @@
+---
+title: "03_scaden_cellular_deconvolution"
+author: "Yayuan Zhu"
+date: "2024-01-31"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 3.1 Introduction
+
+------------------------------------------------------------------------
+
+...
+
+# 3.2 Cellular deconvolution with Scaden
+
+## 3.2.1 Example data
+
+```{bash}
+source functions/functions_bash.sh
+set -e
+
+patternRef="exampleTest"
+patternBulk="example"
+
+dirRef="data/processed_data/scaden_sc_rna_ref_files/${patternRef}"
+dirBulk="data/processed_data/scaden_bulk_rna_files/${patternBulk}"
+dirSimul="temp/scaden_simulated_data"
+dirModel="temp/scaden_trained_models"
+dirPrediction="output/scaden_predictions/${patternRef}"
+
+createDir "${dirPrediction}"
+
+# Setting both start and end to the same number will only run the loop once
+start=1
+end=1
+
+for i in $(seq $start $end)
+do
+  scaden simulate -n 1000 --pattern "*_counts.txt" --data $dirRef --out $dirSimul
+  
+  scaden process "${dirSimul}/${patternRef}.h5ad" "${dirBulk}_bulk_data.txt" --processed_path "${dirSimul}/processed.h5ad"
+
+  scaden train "${dirSimul}/processed.h5ad" --steps 5000 --model_dir $dirModel
+
+  scaden predict --model_dir $dirModel "${dirBulk}_bulk_data.txt" --outname "${patternRef}_n${i}"
+
+  mv "${patternRef}_n${i}" "${dirPrediction}"
+  
+  echo "Moved ${patternRef}_n${i} to ${dirPrediction}"
+  
+  emptyDir $dirSimul $i
+  
+  emptyDir $dirModel $i
+done
+```
+
+## 3.2.2 User data
+
+```{bash}
+source functions/functions_bash.sh
+set -e
+
+patternRef="rAEplaque_bAEplaqueCombine_c7_v1"
+patternBulk="rAEplaque_bAEplaqueCombine"
+
+dirRef="data/processed_data/scaden_sc_rna_ref_files/${patternRef}"
+dirBulk="data/processed_data/scaden_bulk_rna_files/${patternBulk}"
+dirSimul="temp/scaden_simulated_data"
+dirModel="temp/scaden_trained_models"
+dirPrediction="output/scaden_predictions/${patternRef}"
+
+createDir "${dirPrediction}"
+
+# Setting both start and end to the same number will only run the loop once
+start=1
+end=10
+
+for i in $(seq $start $end)
+do
+  scaden simulate -n 1000 --pattern "*_counts.txt" --data $dirRef --out $dirSimul
+
+  scaden process "${dirSimul}/${patternRef}.h5ad" "${dirBulk}_bulk_data.txt" --processed_path "${dirSimul}/processed.h5ad"
+
+  scaden train "${dirSimul}/processed.h5ad" --steps 5000 --model_dir $dirModel
+
+  scaden predict --model_dir $dirModel "${dirBulk}_bulk_data.txt" --outname "${patternRef}_n${i}"
+
+  mv "${patternRef}_n${i}" "${dirPrediction}"
+
+  echo "Moved ${patternRef}_n${i} to ${dirPrediction}"
+
+  emptyDir $dirSimul $i
+
+  emptyDir $dirModel $i
+done
+```
+
+# 3.3 Session info
+
+```{r}
+devtools::session_info()
+```
