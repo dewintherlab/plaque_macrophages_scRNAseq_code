@@ -1,0 +1,8 @@
+# Ignore everything
+*
+# Except .R and .py  files (the code!)
+!*.R
+!*.py
+
+# And keep .gitignore itself
+!.gitignore
